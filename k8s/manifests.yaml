@@ -1,0 +1,323 @@
+# =============================================================================
+# namespace.yaml
+# =============================================================================
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: qsim
+  labels:
+    project: qsim
+    environment: demo
+
+---
+# =============================================================================
+# configmap.yaml
+# Central configuration — change values here, not in Dockerfiles
+# =============================================================================
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: qsim-config
+  namespace: qsim
+data:
+  GATEWAY_URL: "http://qsim-gateway-svc/ingest"
+  SEND_INTERVAL: "2"
+  NUM_ASSETS: "5"
+  DATA_DIR: "/data"
+
+---
+# =============================================================================
+# pvc.yaml
+# Persistent Volume Claim — telemetry logs survive pod restarts
+# Minikube uses hostPath provisioner automatically (no setup needed)
+# WHY: Without this, every pod restart wipes all ingested telemetry.
+#      With PVC, the data lives on the node's disk, not the container.
+# =============================================================================
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: qsim-data-pvc
+  namespace: qsim
+spec:
+  accessModes:
+    - ReadWriteOnce        # One pod writes at a time — fine for demo
+  resources:
+    requests:
+      storage: 1Gi
+  storageClassName: standard  # Minikube's default provisioner
+
+---
+# =============================================================================
+# deployment.yaml — FastAPI Gateway
+# 3 replicas, all three probes, rolling update, resource budgets
+# =============================================================================
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: qsim-gateway
+  namespace: qsim
+  labels:
+    app: qsim-gateway
+    component: api
+    version: v1
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: qsim-gateway
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 1
+      maxSurge: 1
+  template:
+    metadata:
+      labels:
+        app: qsim-gateway
+        component: api
+        version: v1
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "8000"
+        prometheus.io/path: "/metrics"
+    spec:
+      terminationGracePeriodSeconds: 30
+      containers:
+        - name: gateway
+          image: 10mozart/qsim-gateway:v1
+          imagePullPolicy: Always
+          ports:
+            - name: http
+              containerPort: 8000
+          envFrom:
+            - configMapRef:
+                name: qsim-config
+          resources:
+            requests:
+              cpu: "100m"
+              memory: "128Mi"
+            limits:
+              cpu: "400m"
+              memory: "256Mi"
+          volumeMounts:
+            - name: data-volume
+              mountPath: /data     # Matches DATA_DIR in configmap
+          startupProbe:
+            httpGet:
+              path: /health
+              port: http
+            failureThreshold: 12
+            periodSeconds: 5
+            initialDelaySeconds: 3
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: http
+            initialDelaySeconds: 10
+            periodSeconds: 15
+            failureThreshold: 3
+            timeoutSeconds: 5
+          readinessProbe:
+            httpGet:
+              path: /ready
+              port: http
+            initialDelaySeconds: 5
+            periodSeconds: 10
+            failureThreshold: 2
+            timeoutSeconds: 3
+      volumes:
+        - name: data-volume
+          persistentVolumeClaim:
+            claimName: qsim-data-pvc
+
+---
+# =============================================================================
+# service.yaml — Gateway Service
+# ClusterIP: internal only, Ingress handles external exposure
+# =============================================================================
+apiVersion: v1
+kind: Service
+metadata:
+  name: qsim-gateway-svc
+  namespace: qsim
+  labels:
+    app: qsim-gateway
+spec:
+  type: ClusterIP
+  selector:
+    app: qsim-gateway
+  ports:
+    - name: http
+      port: 80
+      targetPort: http
+      protocol: TCP
+
+---
+# =============================================================================
+# deployment.yaml — Factory Generator
+# Single replica — one generator feeding all gateway replicas
+# =============================================================================
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: qsim-generator
+  namespace: qsim
+  labels:
+    app: qsim-generator
+    component: simulator
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: qsim-generator
+  template:
+    metadata:
+      labels:
+        app: qsim-generator
+        component: simulator
+    spec:
+      containers:
+        - name: generator
+          image: 10mozart/qsim-generator:v1
+          imagePullPolicy: Always
+          envFrom:
+            - configMapRef:
+                name: qsim-config
+          resources:
+            requests:
+              cpu: "50m"
+              memory: "64Mi"
+            limits:
+              cpu: "200m"
+              memory: "128Mi"
+
+---
+# =============================================================================
+# ingress.yaml
+# NGINX Ingress — hostname-based access to the gateway API
+# =============================================================================
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: qsim-ingress
+  namespace: qsim
+  annotations:
+    nginx.ingress.kubernetes.io/rewrite-target: /
+spec:
+  ingressClassName: nginx
+  rules:
+    - host: qsim.local
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: qsim-gateway-svc
+                port:
+                  number: 80
+
+---
+# =============================================================================
+# hpa.yaml — Horizontal Pod Autoscaler
+# Scales gateway replicas when CPU > 60%
+# =============================================================================
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: qsim-gateway-hpa
+  namespace: qsim
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: qsim-gateway
+  minReplicas: 2
+  maxReplicas: 6
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 60
+  behavior:
+    scaleDown:
+      stabilizationWindowSeconds: 60
+    scaleUp:
+      stabilizationWindowSeconds: 15
+
+---
+# =============================================================================
+# Dashboard Deployment — Streamlit Live UI
+# =============================================================================
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: qsim-dashboard
+  namespace: qsim
+  labels:
+    app: qsim-dashboard
+    component: ui
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: qsim-dashboard
+  template:
+    metadata:
+      labels:
+        app: qsim-dashboard
+        component: ui
+    spec:
+      containers:
+        - name: dashboard
+          image: 10mozart/qsim-dashboard:v1
+          imagePullPolicy: Always
+          ports:
+            - name: http
+              containerPort: 8501
+          resources:
+            requests:
+              cpu: "100m"
+              memory: "256Mi"
+            limits:
+              cpu: "500m"
+              memory: "512Mi"
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: qsim-dashboard-svc
+  namespace: qsim
+spec:
+  type: ClusterIP
+  selector:
+    app: qsim-dashboard
+  ports:
+    - name: http
+      port: 80
+      targetPort: http
+
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: qsim-dashboard-ingress
+  namespace: qsim
+  annotations:
+    nginx.ingress.kubernetes.io/rewrite-target: /
+spec:
+  ingressClassName: nginx
+  rules:
+    - host: qsim-ui.local
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: qsim-dashboard-svc
+                port:
+                  number: 80
